@@ -2,8 +2,21 @@ import React, { useState, useEffect } from "react";
 import { io } from "socket.io-client";
 import './App.css';
 
-const socketUrl = `${window.location.protocol}//${window.location.hostname}:5000`;
-const socket = io(socketUrl);
+const getSocketUrl = () => {
+  if (process.env.REACT_APP_SOCKET_URL) {
+    return process.env.REACT_APP_SOCKET_URL;
+  }
+
+  if (window.location.hostname === "localhost") {
+    return `${window.location.protocol}//${window.location.hostname}:5000`;
+  }
+
+  return window.location.origin;
+};
+
+const socket = io(getSocketUrl(), {
+  transports: ["websocket", "polling"],
+});
 
 const CHAT_COLORS = [
   "linear-gradient(135deg, #10b981, #14b8a6)",
@@ -39,6 +52,7 @@ function App() {
   const [users, setUsers] = useState([]);
   const [joined, setJoined] = useState(false);
   const [joinError, setJoinError] = useState("");
+  const [socketError, setSocketError] = useState("");
   const [roomInfo, setRoomInfo] = useState({
     roomName: "",
     roomType: "public",
@@ -67,11 +81,25 @@ function App() {
       setJoined(false);
     });
 
+    socket.on("connect", () => {
+      setSocketError("");
+    });
+
+    socket.on("connect_error", () => {
+      setSocketError(
+        "Backend connection failed. Please set REACT_APP_SOCKET_URL to your deployed backend URL."
+      );
+      setJoinError("Unable to connect to the chat server. Please try again later.");
+      setJoined(false);
+    });
+
     return () => {
       socket.off("receiveMessage");
       socket.off("onlineUsers");
       socket.off("joinAccepted");
       socket.off("joinError");
+      socket.off("connect");
+      socket.off("connect_error");
     };
   }, []);
 
@@ -189,6 +217,7 @@ function App() {
             </label>
 
             <button onClick={joinChat}>Join room</button>
+            {socketError && <div className="error-banner">{socketError}</div>}
             {joinError && <div className="error-banner">{joinError}</div>}
           </div>
         </div>

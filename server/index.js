@@ -1,10 +1,13 @@
-﻿const express = require("express");
+﻿require("dotenv").config();
+
+const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const { Server } = require("socket.io");
 const authRoutes = require("./routes/auth");
 const Message = require("./models/Message");
+const User = require("./models/User");
 
 const DEFAULT_MAX_MEMBERS = 5;
 const MAX_ROOM_CAPACITY = 10;
@@ -14,10 +17,16 @@ app.use(cors());
 app.use(express.json());
 app.use("/api/auth", authRoutes);
 
-mongoose
-  .connect("YOUR_MONG_URI")
-  .then(() => console.log("MongoDB connected"))
-  .catch((err) => console.log("MongoDB connection error:", err));
+const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
+
+if (mongoUri) {
+  mongoose
+    .connect(mongoUri)
+    .then(() => console.log("MongoDB connected"))
+    .catch((err) => console.log("MongoDB connection error:", err));
+} else {
+  console.log("MongoDB not configured. Continuing without database connection.");
+}
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -26,6 +35,70 @@ const io = new Server(server, {
 
 const rooms = new Map();
 const users = {};
+
+const isMongoReady = () => mongoose.connection.readyState === 1;
+
+const persistUser = async (socketId, username, roomName, roomType, isAdmin) => {
+  if (!isMongoReady()) {
+    return;
+  }
+
+  try {
+    await User.findOneAndUpdate(
+      { socketId },
+      {
+        username,
+        roomName,
+        roomType,
+        isAdmin,
+        online: true,
+        lastSeen: new Date(),
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+  } catch (error) {
+    console.error("Failed to persist user:", error.message);
+  }
+};
+
+const persistMessage = async (username, roomName, message) => {
+  if (!isMongoReady()) {
+    return;
+  }
+
+  try {
+    await Message.create({
+      username,
+      roomName,
+      message,
+    });
+  } catch (error) {
+    console.error("Failed to persist message:", error.message);
+  }
+};
+
+const setUserOffline = async (socketId) => {
+  if (!isMongoReady()) {
+    return;
+  }
+
+  try {
+    await User.findOneAndUpdate(
+      { socketId },
+      {
+        online: false,
+        lastSeen: new Date(),
+      },
+      { new: true }
+    );
+  } catch (error) {
+    console.error("Failed to mark user offline:", error.message);
+  }
+};
 
 const getOnlineUsersInRoom = (roomName) => {
   return Object.entries(users)
@@ -64,6 +137,7 @@ io.on("connection", (socket) => {
       rooms.set(roomName, room);
       users[socket.id] = { username, roomName };
       socket.join(roomName);
+      persistUser(socket.id, username, roomName, roomType, true);
 
       io.to(roomName).emit("onlineUsers", getOnlineUsersInRoom(roomName));
       socket.emit("joinAccepted", {
@@ -103,6 +177,7 @@ io.on("connection", (socket) => {
     room.members.add(socket.id);
     users[socket.id] = { username, roomName };
     socket.join(roomName);
+    persistUser(socket.id, username, roomName, room.type, false);
 
     io.to(roomName).emit("onlineUsers", getOnlineUsersInRoom(roomName));
     socket.emit("joinAccepted", {
@@ -126,6 +201,8 @@ io.on("connection", (socket) => {
     if (!roomInfo || !message) {
       return;
     }
+
+    persistMessage(sender, roomInfo.roomName, message);
 
     io.to(roomInfo.roomName).emit("receiveMessage", {
       username: sender,
@@ -157,6 +234,7 @@ io.on("connection", (socket) => {
     }
 
     delete users[socket.id];
+    setUserOffline(socket.id);
 
     if (room && room.members.size > 0) {
       io.to(room.name).emit("onlineUsers", getOnlineUsersInRoom(room.name));
@@ -194,6 +272,7 @@ io.on("connection", (socket) => {
     }
 
     delete users[socket.id];
+    setUserOffline(socket.id);
 
     if (room && room.members.size > 0) {
       io.to(room.name).emit("onlineUsers", getOnlineUsersInRoom(room.name));
