@@ -1,10 +1,9 @@
 import React, { useState, useEffect } from "react";
-import { io } from "socket.io-client";
 import './App.css';
 
-const getSocketUrl = () => {
-  if (process.env.REACT_APP_SOCKET_URL) {
-    return process.env.REACT_APP_SOCKET_URL;
+const getApiBaseUrl = () => {
+  if (process.env.REACT_APP_API_URL) {
+    return process.env.REACT_APP_API_URL;
   }
 
   if (window.location.hostname === "localhost") {
@@ -14,9 +13,7 @@ const getSocketUrl = () => {
   return window.location.origin;
 };
 
-const socket = io(getSocketUrl(), {
-  transports: ["websocket", "polling"],
-});
+const API_BASE_URL = getApiBaseUrl();
 
 const CHAT_COLORS = [
   "linear-gradient(135deg, #10b981, #14b8a6)",
@@ -53,6 +50,8 @@ function App() {
   const [joined, setJoined] = useState(false);
   const [joinError, setJoinError] = useState("");
   const [socketError, setSocketError] = useState("");
+  const [clientId, setClientId] = useState("");
+  const [activeRoomName, setActiveRoomName] = useState("");
   const [roomInfo, setRoomInfo] = useState({
     roomName: "",
     roomType: "public",
@@ -61,49 +60,69 @@ function App() {
     adminName: "",
   });
 
+  const resetRoomState = () => {
+    setJoined(false);
+    setChat([]);
+    setUsers([]);
+    setMessage("");
+    setJoinError("");
+    setSocketError("");
+    setRoomInfo({
+      roomName: "",
+      roomType: "public",
+      maxMembers: 5,
+      isAdmin: false,
+      adminName: "",
+    });
+    setActiveRoomName("");
+  };
+
   useEffect(() => {
-    socket.on("receiveMessage", (data) => {
-      setChat((prev) => [...prev, data]);
-    });
+    if (!joined || !activeRoomName || !clientId) {
+      return undefined;
+    }
 
-    socket.on("onlineUsers", (activeUsers) => {
-      setUsers(activeUsers);
-    });
+    let isMounted = true;
 
-    socket.on("joinAccepted", ({ roomName, roomType, maxMembers, isAdmin, adminName }) => {
-      setRoomInfo({ roomName, roomType, maxMembers, isAdmin, adminName });
-      setJoined(true);
-      setJoinError("");
-    });
+    const pollRoomState = async () => {
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/api/chat/state?roomName=${encodeURIComponent(activeRoomName)}&clientId=${encodeURIComponent(clientId)}`
+        );
 
-    socket.on("joinError", (errorMessage) => {
-      setJoinError(errorMessage);
-      setJoined(false);
-    });
+        if (!response.ok) {
+          throw new Error("Unable to refresh chat state.");
+        }
 
-    socket.on("connect", () => {
-      setSocketError("");
-    });
+        const data = await response.json();
 
-    socket.on("connect_error", () => {
-      setSocketError(
-        "Backend connection failed. Please set REACT_APP_SOCKET_URL to your deployed backend URL."
-      );
-      setJoinError("Unable to connect to the chat server. Please try again later.");
-      setJoined(false);
-    });
+        if (!isMounted) {
+          return;
+        }
+
+        setUsers(data.users || []);
+        setChat(data.messages || []);
+
+        if (data.roomInfo) {
+          setRoomInfo(data.roomInfo);
+        }
+      } catch (error) {
+        if (isMounted) {
+          setSocketError(error.message || "Unable to refresh chat state.");
+        }
+      }
+    };
+
+    pollRoomState();
+    const intervalId = setInterval(pollRoomState, 1500);
 
     return () => {
-      socket.off("receiveMessage");
-      socket.off("onlineUsers");
-      socket.off("joinAccepted");
-      socket.off("joinError");
-      socket.off("connect");
-      socket.off("connect_error");
+      isMounted = false;
+      clearInterval(intervalId);
     };
-  }, []);
+  }, [activeRoomName, clientId, joined]);
 
-  const joinChat = () => {
+  const joinChat = async () => {
     const trimmedUsername = username.trim();
     const trimmedRoomName = roomName.trim() || "general";
 
@@ -112,37 +131,101 @@ function App() {
       return;
     }
 
-    socket.emit("join", {
-      username: trimmedUsername,
-      roomName: trimmedRoomName,
-      roomType,
-      maxMembers,
-      isAdmin,
-    });
-  };
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/chat/join`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username: trimmedUsername,
+          roomName: trimmedRoomName,
+          roomType,
+          maxMembers,
+          isAdmin,
+          clientId,
+        }),
+      });
 
-  const sendMessage = () => {
-    if (message.trim()) {
-      const msgData = { username, message: message.trim() };
-      socket.emit("sendMessage", msgData);
-      setMessage("");
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || "Unable to join the room.");
+      }
+
+      setClientId(data.clientId);
+      setActiveRoomName(trimmedRoomName);
+      setRoomInfo(data.roomInfo || {
+        roomName: trimmedRoomName,
+        roomType,
+        maxMembers,
+        isAdmin: data.roomInfo?.isAdmin || false,
+        adminName: data.roomInfo?.adminName || "",
+      });
+      setUsers(data.users || []);
+      setChat(data.messages || []);
+      setJoined(true);
+      setJoinError("");
+      setSocketError("");
+    } catch (error) {
+      setJoinError(error.message || "Unable to join the room.");
+      setJoined(false);
     }
   };
 
-  const leaveRoom = () => {
-    socket.emit("leaveRoom");
-    setJoined(false);
-    setChat([]);
-    setUsers([]);
-    setMessage("");
-    setJoinError("");
-    setRoomInfo({
-      roomName: "",
-      roomType: "public",
-      maxMembers: 5,
-      isAdmin: false,
-      adminName: "",
-    });
+  const sendMessage = async () => {
+    if (!message.trim()) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/chat/message`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          clientId,
+          roomName: activeRoomName,
+          message: message.trim(),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || "Unable to send message.");
+      }
+
+      setChat(data.messages || []);
+      setUsers(data.users || []);
+      setMessage("");
+      setSocketError("");
+    } catch (error) {
+      setSocketError(error.message || "Unable to send message.");
+    }
+  };
+
+  const leaveRoom = async () => {
+    try {
+      if (clientId && activeRoomName) {
+        await fetch(`${API_BASE_URL}/api/chat/leave`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            clientId,
+            roomName: activeRoomName,
+          }),
+        });
+      }
+    } catch (error) {
+      setSocketError(error.message || "Unable to leave the room.");
+    }
+
+    setClientId("");
+    resetRoomState();
   };
 
   const handleKeyDown = (event) => {

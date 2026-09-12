@@ -1,16 +1,15 @@
 ﻿require("dotenv").config();
 
 const express = require("express");
-const http = require("http");
 const cors = require("cors");
 const mongoose = require("mongoose");
-const { Server } = require("socket.io");
 const authRoutes = require("./routes/auth");
 const Message = require("./models/Message");
 const User = require("./models/User");
 
 const DEFAULT_MAX_MEMBERS = 5;
 const MAX_ROOM_CAPACITY = 10;
+const MESSAGE_LIMIT = 100;
 
 const app = express();
 app.use(cors());
@@ -28,24 +27,84 @@ if (mongoUri) {
   console.log("MongoDB not configured. Continuing without database connection.");
 }
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
-
 const rooms = new Map();
-const users = {};
+const roomMessages = new Map();
+const sessions = new Map();
 
 const isMongoReady = () => mongoose.connection.readyState === 1;
 
-const persistUser = async (socketId, username, roomName, roomType, isAdmin) => {
+const normalizeRoomName = (value) => String(value || "").trim();
+
+const clampMaxMembers = (value) => {
+  const requestedMaxMembers = Number(value) || DEFAULT_MAX_MEMBERS;
+  return Math.min(Math.max(requestedMaxMembers, 1), MAX_ROOM_CAPACITY);
+};
+
+const createClientId = () =>
+  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+const getMessagesForRoom = (roomName) => {
+  if (!roomMessages.has(roomName)) {
+    roomMessages.set(roomName, []);
+  }
+
+  return roomMessages.get(roomName);
+};
+
+const getRoomUsers = (room) => {
+  return Array.from(room.members)
+    .map((clientId) => sessions.get(clientId))
+    .filter(Boolean)
+    .map((session) => session.username);
+};
+
+const syncRoomAdmin = (room) => {
+  if (room.members.size === 0) {
+    rooms.delete(room.name);
+    return;
+  }
+
+  const nextAdminClientId = Array.from(room.members)[0];
+  const nextAdminSession = sessions.get(nextAdminClientId);
+
+  room.adminClientId = nextAdminClientId;
+  room.adminUsername = nextAdminSession ? nextAdminSession.username : null;
+};
+
+const getRoomInfo = (room, clientId) => ({
+  roomName: room.name,
+  roomType: room.type,
+  maxMembers: room.maxMembers,
+  isAdmin: room.adminClientId === clientId,
+  adminName: room.adminUsername || "Not assigned",
+});
+
+const getRoomState = (roomName, clientId) => {
+  const room = rooms.get(roomName);
+
+  if (!room) {
+    return {
+      roomInfo: null,
+      users: [],
+      messages: [],
+    };
+  }
+
+  return {
+    roomInfo: getRoomInfo(room, clientId),
+    users: getRoomUsers(room),
+    messages: getMessagesForRoom(roomName),
+  };
+};
+
+const persistUser = async (clientId, username, roomName, roomType, isAdmin) => {
   if (!isMongoReady()) {
     return;
   }
 
   try {
     await User.findOneAndUpdate(
-      { socketId },
+      { socketId: clientId },
       {
         username,
         roomName,
@@ -81,14 +140,14 @@ const persistMessage = async (username, roomName, message) => {
   }
 };
 
-const setUserOffline = async (socketId) => {
+const setUserOffline = async (clientId) => {
   if (!isMongoReady()) {
     return;
   }
 
   try {
     await User.findOneAndUpdate(
-      { socketId },
+      { socketId: clientId },
       {
         online: false,
         lastSeen: new Date(),
@@ -100,190 +159,169 @@ const setUserOffline = async (socketId) => {
   }
 };
 
-const getOnlineUsersInRoom = (roomName) => {
-  return Object.entries(users)
-    .filter(([, user]) => user.roomName === roomName)
-    .map(([, user]) => user.username);
-};
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, message: "Chat API is running." });
+});
 
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+app.get("/api/chat/state", (req, res) => {
+  const roomName = normalizeRoomName(req.query.roomName);
+  const clientId = String(req.query.clientId || "").trim();
 
-  socket.on("join", (payload = {}) => {
-    const username = String(payload.username || "").trim();
-    const roomName = String(payload.roomName || "").trim();
-    const roomType = payload.roomType === "private" ? "private" : "public";
-    const requestedMaxMembers = Number(payload.maxMembers) || DEFAULT_MAX_MEMBERS;
-    const maxMembers = Math.min(Math.max(requestedMaxMembers, 1), MAX_ROOM_CAPACITY);
-    const isAdmin = Boolean(payload.isAdmin);
+  if (!roomName) {
+    return res.status(400).json({ message: "Room name is required." });
+  }
 
-    if (!username || !roomName) {
-      socket.emit("joinError", "Username and room name are required.");
-      return;
+  const state = getRoomState(roomName, clientId);
+  return res.json(state);
+});
+
+app.post("/api/chat/join", async (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const roomName = normalizeRoomName(req.body?.roomName);
+  const roomType = req.body?.roomType === "private" ? "private" : "public";
+  const maxMembers = clampMaxMembers(req.body?.maxMembers);
+  const incomingClientId = String(req.body?.clientId || "").trim();
+  const clientId = incomingClientId || createClientId();
+
+  if (!username || !roomName) {
+    return res.status(400).json({ message: "Username and room name are required." });
+  }
+
+  const existingSession = sessions.get(clientId);
+
+  if (existingSession && existingSession.roomName !== roomName) {
+    const previousRoom = rooms.get(existingSession.roomName);
+
+    if (previousRoom) {
+      previousRoom.members.delete(clientId);
+      syncRoomAdmin(previousRoom);
     }
 
-    let room = rooms.get(roomName);
+    sessions.delete(clientId);
+    setUserOffline(clientId);
+  }
 
-    if (!room) {
-      room = {
-        name: roomName,
-        type: roomType,
-        maxMembers,
-        adminSocketId: socket.id,
-        adminUsername: username,
-        members: new Set([socket.id]),
-      };
+  let room = rooms.get(roomName);
 
-      rooms.set(roomName, room);
-      users[socket.id] = { username, roomName };
-      socket.join(roomName);
-      persistUser(socket.id, username, roomName, roomType, true);
+  if (!room) {
+    room = {
+      name: roomName,
+      type: roomType,
+      maxMembers,
+      adminClientId: clientId,
+      adminUsername: username,
+      members: new Set([clientId]),
+    };
 
-      io.to(roomName).emit("onlineUsers", getOnlineUsersInRoom(roomName));
-      socket.emit("joinAccepted", {
-        roomName,
-        roomType: room.type,
-        maxMembers: room.maxMembers,
-        isAdmin: true,
-        adminName: room.adminUsername,
-      });
-      io.to(roomName).emit("receiveMessage", {
-        username: "System",
-        message: `${username} created the ${room.type} room "${roomName}" and joined as admin.`,
-      });
-      return;
-    }
+    rooms.set(roomName, room);
+    sessions.set(clientId, { clientId, username, roomName });
+    persistUser(clientId, username, roomName, roomType, true);
 
-    if (room.members.has(socket.id)) {
-      socket.join(roomName);
-      socket.emit("joinAccepted", {
-        roomName,
-        roomType: room.type,
-        maxMembers: room.maxMembers,
-        isAdmin: socket.id === room.adminSocketId,
-        adminName: room.adminUsername,
-      });
-      return;
-    }
-
-    if (room.members.size >= room.maxMembers) {
-      socket.emit(
-        "joinError",
-        `Room is full. Maximum ${room.maxMembers} member(s) allowed.`
-      );
-      return;
-    }
-
-    room.members.add(socket.id);
-    users[socket.id] = { username, roomName };
-    socket.join(roomName);
-    persistUser(socket.id, username, roomName, room.type, false);
-
-    io.to(roomName).emit("onlineUsers", getOnlineUsersInRoom(roomName));
-    socket.emit("joinAccepted", {
-      roomName,
-      roomType: room.type,
-      maxMembers: room.maxMembers,
-      isAdmin: false,
-      adminName: room.adminUsername,
+    return res.json({
+      clientId,
+      ...getRoomState(roomName, clientId),
     });
-    io.to(roomName).emit("receiveMessage", {
-      username: "System",
-      message: `${username} joined the ${room.type} room "${roomName}".`,
+  }
+
+  if (room.members.has(clientId)) {
+    const session = sessions.get(clientId);
+
+    if (session) {
+      session.username = username;
+      session.roomName = roomName;
+    }
+
+    return res.json({
+      clientId,
+      ...getRoomState(roomName, clientId),
     });
-  });
+  }
 
-  socket.on("sendMessage", (data) => {
-    const roomInfo = users[socket.id];
-    const message = String(data?.message || "").trim();
-    const sender = roomInfo?.username || "User";
-
-    if (!roomInfo || !message) {
-      return;
-    }
-
-    persistMessage(sender, roomInfo.roomName, message);
-
-    io.to(roomInfo.roomName).emit("receiveMessage", {
-      username: sender,
-      message,
+  if (room.members.size >= room.maxMembers) {
+    return res.status(409).json({
+      message: `Room is full. Maximum ${room.maxMembers} member(s) allowed.`,
     });
-  });
+  }
 
-  socket.on("leaveRoom", () => {
-    const leavingUser = users[socket.id];
+  room.members.add(clientId);
+  sessions.set(clientId, { clientId, username, roomName });
+  persistUser(clientId, username, roomName, room.type, false);
 
-    if (!leavingUser) {
-      return;
-    }
+  const state = getRoomState(roomName, clientId);
 
-    const room = rooms.get(leavingUser.roomName);
-
-    if (room) {
-      room.members.delete(socket.id);
-
-      if (room.adminSocketId === socket.id) {
-        const nextAdmin = Array.from(room.members)[0] || null;
-        room.adminSocketId = nextAdmin;
-        room.adminUsername = nextAdmin ? users[nextAdmin]?.username || null : null;
-      }
-
-      if (room.members.size === 0) {
-        rooms.delete(leavingUser.roomName);
-      }
-    }
-
-    delete users[socket.id];
-    setUserOffline(socket.id);
-
-    if (room && room.members.size > 0) {
-      io.to(room.name).emit("onlineUsers", getOnlineUsersInRoom(room.name));
-      io.to(room.name).emit("receiveMessage", {
-        username: "System",
-        message: `${leavingUser.username} left the room.`,
-      });
-    }
-
-    socket.leave(leavingUser.roomName);
-    socket.emit("leaveRoomSuccess");
-  });
-
-  socket.on("disconnect", () => {
-    const leavingUser = users[socket.id];
-
-    if (!leavingUser) {
-      return;
-    }
-
-    const room = rooms.get(leavingUser.roomName);
-
-    if (room) {
-      room.members.delete(socket.id);
-
-      if (room.adminSocketId === socket.id) {
-        const nextAdmin = Array.from(room.members)[0] || null;
-        room.adminSocketId = nextAdmin;
-        room.adminUsername = nextAdmin ? users[nextAdmin]?.username || null : null;
-      }
-
-      if (room.members.size === 0) {
-        rooms.delete(leavingUser.roomName);
-      }
-    }
-
-    delete users[socket.id];
-    setUserOffline(socket.id);
-
-    if (room && room.members.size > 0) {
-      io.to(room.name).emit("onlineUsers", getOnlineUsersInRoom(room.name));
-      io.to(room.name).emit("receiveMessage", {
-        username: "System",
-        message: `${leavingUser.username} left the room.`,
-      });
-    }
+  return res.json({
+    clientId,
+    ...state,
   });
 });
 
-server.listen(5000, () => {
-  console.log("Server is running on port 5000");
+app.post("/api/chat/message", async (req, res) => {
+  const clientId = String(req.body?.clientId || "").trim();
+  const roomName = normalizeRoomName(req.body?.roomName);
+  const message = String(req.body?.message || "").trim();
+  const session = sessions.get(clientId);
+
+  if (!session || session.roomName !== roomName) {
+    return res.status(400).json({ message: "You must join a room before sending messages." });
+  }
+
+  if (!message) {
+    return res.status(400).json({ message: "Message cannot be empty." });
+  }
+
+  const room = rooms.get(roomName);
+
+  if (!room) {
+    return res.status(404).json({ message: "Room not found." });
+  }
+
+  const messages = getMessagesForRoom(roomName);
+  messages.push({
+    username: session.username,
+    message,
+    timestamp: new Date().toISOString(),
+  });
+
+  if (messages.length > MESSAGE_LIMIT) {
+    messages.shift();
+  }
+
+  persistMessage(session.username, roomName, message);
+
+  return res.json({
+    ok: true,
+    ...getRoomState(roomName, clientId),
+  });
+});
+
+app.post("/api/chat/leave", async (req, res) => {
+  const clientId = String(req.body?.clientId || "").trim();
+  const roomName = normalizeRoomName(req.body?.roomName);
+  const session = sessions.get(clientId);
+
+  if (!session && !roomName) {
+    return res.json({ ok: true, roomInfo: null, users: [], messages: [] });
+  }
+
+  const targetRoomName = roomName || session?.roomName;
+  const room = targetRoomName ? rooms.get(targetRoomName) : null;
+
+  if (room && clientId) {
+    room.members.delete(clientId);
+    syncRoomAdmin(room);
+  }
+
+  if (session) {
+    sessions.delete(clientId);
+    setUserOffline(clientId);
+  }
+
+  const state = targetRoomName ? getRoomState(targetRoomName, clientId) : { roomInfo: null, users: [], messages: [] };
+
+  return res.json({ ok: true, ...state });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
 });

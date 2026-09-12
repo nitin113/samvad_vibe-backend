@@ -4,7 +4,7 @@ Samvad_Vibe is a real-time chat application with room support, admin controls, a
 
 ## Project structure
 
-- `server/` — Express + Socket.IO backend
+- `server/` — Express backend using REST + polling for chat updates
 - `server/client/` — React frontend
 - `server/models/` — MongoDB schemas
 - `server/routes/` — API routes
@@ -47,7 +47,7 @@ npm start
 Create a `.env` file inside `server/client`:
 
 ```env
-REACT_APP_SOCKET_URL=https://your-backend-url
+REACT_APP_API_URL=https://your-backend-url
 ```
 
 ## Deployment architecture
@@ -55,12 +55,12 @@ REACT_APP_SOCKET_URL=https://your-backend-url
 Use this setup:
 
 - Frontend: Vercel
-- Backend: Render / Railway / Fly.io / another Node host
+- Backend: Vercel serverless API or another Node host
 - Database: MongoDB Atlas
 
 ### Backend deployment requirements
 
-Set these environment variables on your Node host:
+Set these environment variables on your Node host or serverless deployment:
 
 ```env
 MONGODB_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/Samvad_Vibe
@@ -72,12 +72,12 @@ PORT=5000
 Set this environment variable in Vercel:
 
 ```env
-REACT_APP_SOCKET_URL=https://your-backend-url
+REACT_APP_API_URL=https://your-backend-url
 ```
 
 ## Important note
 
-Vercel alone cannot host the Socket.IO backend. The real-time server must be deployed separately.
+This version uses REST polling for chat updates, which makes it easier to run in Vercel-compatible environments.
 
 ## Features
 
