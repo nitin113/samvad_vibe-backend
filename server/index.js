@@ -16,13 +16,21 @@ app.use(cors());
 app.use(express.json());
 app.use("/api/auth", authRoutes);
 
-const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
+const mongoUri = (process.env.MONGODB_URI || process.env.MONGO_URI || "").trim();
 
 if (mongoUri) {
-  mongoose
-    .connect(mongoUri)
-    .then(() => console.log("MongoDB connected"))
-    .catch((err) => console.log("MongoDB connection error:", err));
+  const hasValidMongoScheme = /^mongodb(\+srv)?:\/\//i.test(mongoUri);
+
+  if (!hasValidMongoScheme) {
+    console.error(
+      "Invalid MongoDB connection string. Expected a value starting with 'mongodb://' or 'mongodb+srv://'. Check server/.env and remove the bad MONGODB_URI/MONGO_URI value."
+    );
+  } else {
+    mongoose
+      .connect(mongoUri)
+      .then(() => console.log("MongoDB connected"))
+      .catch((err) => console.log("MongoDB connection error:", err));
+  }
 } else {
   console.log("MongoDB not configured. Continuing without database connection.");
 }
